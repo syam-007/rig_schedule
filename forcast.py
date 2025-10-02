@@ -17,23 +17,6 @@ def extract_rig_number(work_center):
     return None
 
 
-def get_job_type(service_type):
-    """Determine Job Type based on Service Type"""
-    if pd.isna(service_type):
-        return 'DG'
-    service_str = str(service_type).lower()
-    if 'mwd' in service_str:
-        return 'DG'
-    elif 'gyroscopic multi-shot' in service_str:
-        return 'DG2'
-    elif 'memory' in service_str or 'drop' in service_str:
-        return 'DG3'
-    elif 'wl' in service_str:
-        return 'WL'
-    else:
-        return 'DG'
-
-
 def read_with_header_detection(file, keywords=["Rig", "Gyro Provider", "Service Type"]):
     """Read Excel and auto-detect correct header row"""
     tmp = pd.read_excel(file, header=None)
@@ -52,7 +35,7 @@ def read_with_header_detection(file, keywords=["Rig", "Gyro Provider", "Service 
 
 # ---------- Core Processing ----------
 
-def process_files(file1, file2, selected_month, selected_year, selected_party):
+def process_files(file1, file2, selected_month, selected_year, selected_party, latest_days, extra_columns):
     """Process Excel files and return merged results"""
 
     # Read first file (schedule)
@@ -89,22 +72,43 @@ def process_files(file1, file2, selected_month, selected_year, selected_party):
     records = []
     for _, row in merged.iterrows():
         start_date = row['Earl.start date']
+        end_date = row.get('EarliestEndDate', None)
+
         if isinstance(start_date, str):
             start_date = pd.to_datetime(start_date, errors='coerce')
+        if isinstance(end_date, str):
+            end_date = pd.to_datetime(end_date, errors='coerce')
+
         if pd.isna(start_date):
             continue
 
-        for col in callout_cols:
-            offset = pd.to_numeric(row[col], errors='coerce')
-            if pd.isna(offset):
-                continue
-            expected_date = start_date + timedelta(days=int(offset))
+        well_name = str(row['Well Name']).strip()
+
+        # Special case: RIG MOVE / RIG MAINTENANCE
+        if well_name.upper().startswith("RIG MOVE") or well_name.upper().startswith("RIG MAINTENANCE"):
             records.append({
                 "Rig": row['Rig_Number'],
-                "Well": row['Well Name'],
-                "Job Type": get_job_type(row['Service Type']),
-                "Expected Date": expected_date
+                "Well": f"{well_name} ",
+                "Job Type": "MAINT",   # internal flag
+                "Expected Date": start_date,
+                "Latest Expected Date": end_date if not pd.isna(end_date) else start_date,
+                **{col: row[col] for col in extra_columns if col in row}
             })
+        else:
+            for col in callout_cols:
+                offset = pd.to_numeric(row[col], errors='coerce')
+                if pd.isna(offset):
+                    continue
+                expected_date = start_date + timedelta(days=int(offset))
+                latest_expected = expected_date + timedelta(days=latest_days)
+                records.append({
+                    "Rig": row['Rig_Number'],
+                    "Well": well_name,
+                    "Job Type": row['Service Type'],   # use exact service type from 2nd file
+                    "Expected Date": expected_date,
+                    "Latest Expected Date": latest_expected,
+                    **{col: row[col] for col in extra_columns if col in row}
+                })
 
     result_df = pd.DataFrame(records)
 
@@ -118,13 +122,38 @@ def process_files(file1, file2, selected_month, selected_year, selected_party):
     if result_df.empty:
         return pd.DataFrame()
 
+    # Separate maintenance rows
+    # maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
+    # normal_df = result_df[result_df['Job Type'] != "MAINT"].copy()
+    #
+    # # Replace display label
+    # maint_df["Job Type"] = "Under Maintenance"
+    #
+    # # Combine with blank row separator
+    # separator = pd.DataFrame([[""] * len(result_df.columns)], columns=result_df.columns)
+    # result_df = pd.concat([normal_df, separator, maint_df], ignore_index=True)
+    maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
+    normal_df = result_df[result_df['Job Type'] != "MAINT"].copy()
+
+    # Ensure Job Type is labeled clearly
+    maint_df["Job Type"] = "Under Maintenance"
+
+    # Concatenate directly (no separator row)
+    result_df = pd.concat([normal_df, maint_df], ignore_index=True)
     # Format final output
     result_df = result_df.reset_index(drop=True)
     result_df['S.No'] = result_df.index + 1
 
-    result_df['Expected Date'] = result_df['Expected Date'].dt.strftime('%d-%b-%Y')
+    # Format dates
+    if "Expected Date" in result_df.columns:
+        result_df['Expected Date'] = pd.to_datetime(result_df['Expected Date'], errors='coerce').dt.strftime('%d-%b-%Y')
+    if "Latest Expected Date" in result_df.columns:
+        result_df['Latest Expected Date'] = pd.to_datetime(result_df['Latest Expected Date'], errors='coerce').dt.strftime('%d-%b-%Y')
 
-    return result_df[['S.No',  'Rig', 'Well', 'Job Type', 'Expected Date']]
+    result_df.rename(columns={"Expected Date": "Earlier Expected Date"}, inplace=True)
+
+    base_cols = ['S.No', 'Rig', 'Well', 'Job Type', 'Earlier Expected Date', 'Latest Expected Date']
+    return result_df[base_cols + extra_columns]
 
 
 # ---------- Streamlit UI ----------
@@ -147,6 +176,7 @@ def main():
     years = ["All"] + list(range(datetime.now().year, datetime.now().year + 5))
 
     parties = ["All"]
+    extra_columns = []
     if file2:
         try:
             df2_temp = read_with_header_detection(file2)
@@ -155,7 +185,7 @@ def main():
         except:
             pass
 
-    st.subheader("🔧 Filters")
+    st.subheader("🔧 Filters & Options")
     col3, col4, col5 = st.columns(3)
     with col3:
         selected_month = st.selectbox("📅 Select Month", months)
@@ -164,9 +194,16 @@ def main():
     with col5:
         selected_party = st.selectbox("🏢 Select Gyro Provider", parties)
 
+    latest_days = st.number_input("➕ Add days for Latest Expected Date", min_value=0, max_value=30, value=2)
+
+    if file1:
+        df1_temp = pd.read_excel(file1, nrows=1)
+        cols = df1_temp.columns.tolist()
+        extra_columns = st.multiselect("📋 Extra columns from Schedule File", cols)
+
     if file1 and file2:
         with st.spinner("🔄 Processing..."):
-            result_df = process_files(file1, file2, selected_month, selected_year, selected_party)
+            result_df = process_files(file1, file2, selected_month, selected_year, selected_party, latest_days, extra_columns)
 
         if not result_df.empty:
             st.success(f"✅ Processed {len(result_df)} records")
