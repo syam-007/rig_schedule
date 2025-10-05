@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import re
+from io import BytesIO
 
 
 # ---------- Helpers ----------
@@ -50,11 +51,15 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
     df2 = df2.dropna(subset=['Rig'])
     df2['Rig'] = df2['Rig'].astype(int)
 
+    # Replace N/A or blanks in Gyro Provider with 'MWD'
+    if "Gyro Provider" in df2.columns:
+        df2['Gyro Provider'] = df2['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
+
     # Filter by Gyro Provider
     if selected_party != "All" and "Gyro Provider" in df2.columns:
         df2 = df2[df2['Gyro Provider'] == selected_party]
 
-    # Merge
+    # Merge schedule + rig details
     merged = pd.merge(
         df1,
         df2,
@@ -65,6 +70,10 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
 
     if merged.empty:
         return pd.DataFrame()
+
+    # Always include Gyro Provider in the output if available
+    if "Gyro Provider" in merged.columns and "Gyro Provider" not in extra_columns:
+        extra_columns = ["Gyro Provider"] + extra_columns
 
     # Expand rows for multiple callout offsets
     callout_cols = [col for col in merged.columns if "Callout" in col and "offset" in col]
@@ -89,7 +98,7 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
             records.append({
                 "Rig": row['Rig_Number'],
                 "Well": f"{well_name} ",
-                "Job Type": "MAINT",   # internal flag
+                "Job Type": "MAINT",
                 "Expected Date": start_date,
                 "Latest Expected Date": end_date if not pd.isna(end_date) else start_date,
                 **{col: row[col] for col in extra_columns if col in row}
@@ -104,7 +113,7 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
                 records.append({
                     "Rig": row['Rig_Number'],
                     "Well": well_name,
-                    "Job Type": row['Service Type'],   # use exact service type from 2nd file
+                    "Job Type": row['Service Type'],
                     "Expected Date": expected_date,
                     "Latest Expected Date": latest_expected,
                     **{col: row[col] for col in extra_columns if col in row}
@@ -122,25 +131,17 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
     if result_df.empty:
         return pd.DataFrame()
 
+    # Replace N/A or blanks in Gyro Provider again (post-merge)
+    if "Gyro Provider" in result_df.columns:
+        result_df['Gyro Provider'] = result_df['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
+
     # Separate maintenance rows
-    # maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
-    # normal_df = result_df[result_df['Job Type'] != "MAINT"].copy()
-    #
-    # # Replace display label
-    # maint_df["Job Type"] = "Under Maintenance"
-    #
-    # # Combine with blank row separator
-    # separator = pd.DataFrame([[""] * len(result_df.columns)], columns=result_df.columns)
-    # result_df = pd.concat([normal_df, separator, maint_df], ignore_index=True)
     maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
     normal_df = result_df[result_df['Job Type'] != "MAINT"].copy()
-
-    # Ensure Job Type is labeled clearly
     maint_df["Job Type"] = "Under Maintenance"
 
-    # Concatenate directly (no separator row)
+    # Combine all
     result_df = pd.concat([normal_df, maint_df], ignore_index=True)
-    # Format final output
     result_df = result_df.reset_index(drop=True)
     result_df['S.No'] = result_df.index + 1
 
@@ -152,8 +153,13 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
 
     result_df.rename(columns={"Expected Date": "Earlier Expected Date"}, inplace=True)
 
-    base_cols = ['S.No', 'Rig', 'Well', 'Job Type', 'Earlier Expected Date', 'Latest Expected Date']
-    return result_df[base_cols + extra_columns]
+    # Final column order (Gyro Provider added)
+    base_cols = ['S.No', 'Rig', 'Well', 'Job Type', 'Gyro Provider', 'Earlier Expected Date', 'Latest Expected Date']
+
+    # Only keep columns that exist
+    base_cols = [col for col in base_cols if col in result_df.columns]
+
+    return result_df[base_cols + [col for col in extra_columns if col not in base_cols]]
 
 
 # ---------- Streamlit UI ----------
@@ -181,6 +187,7 @@ def main():
         try:
             df2_temp = read_with_header_detection(file2)
             if 'Gyro Provider' in df2_temp.columns:
+                df2_temp['Gyro Provider'] = df2_temp['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
                 parties = ["All"] + sorted(df2_temp['Gyro Provider'].dropna().unique().tolist())
         except:
             pass
@@ -209,13 +216,27 @@ def main():
             st.success(f"✅ Processed {len(result_df)} records")
             st.dataframe(result_df, use_container_width=True)
 
+            # ---------- Export Section ----------
             csv = result_df.to_csv(index=False)
+
+            excel_buffer = BytesIO()
+            result_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+
             st.download_button(
                 "📥 Download CSV",
                 data=csv,
                 file_name=f"rig_schedule_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv"
             )
+
+            st.download_button(
+                "📘 Download Excel",
+                data=excel_buffer,
+                file_name=f"rig_schedule_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
         else:
             st.warning("❌ No matching records found for the selected filters.")
 
