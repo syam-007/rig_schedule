@@ -36,7 +36,7 @@ def read_with_header_detection(file, keywords=["Rig", "Gyro Provider", "Service 
 
 # ---------- Core Processing ----------
 
-def process_files(file1, file2, selected_month, selected_year, selected_party, latest_days, extra_columns):
+def process_files(file1, file2, start_date, end_date, selected_party, latest_days, extra_columns):
     """Process Excel files and return merged results"""
 
     # Read first file (schedule)
@@ -80,15 +80,15 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
 
     records = []
     for _, row in merged.iterrows():
-        start_date = row['Earl.start date']
-        end_date = row.get('EarliestEndDate', None)
+        start_date_raw = row['Earl.start date']
+        end_date_raw = row.get('EarliestEndDate', None)
 
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date, errors='coerce')
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date, errors='coerce')
+        if isinstance(start_date_raw, str):
+            start_date_raw = pd.to_datetime(start_date_raw, errors='coerce')
+        if isinstance(end_date_raw, str):
+            end_date_raw = pd.to_datetime(end_date_raw, errors='coerce')
 
-        if pd.isna(start_date):
+        if pd.isna(start_date_raw):
             continue
 
         well_name = str(row['Well Name']).strip()
@@ -99,8 +99,8 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
                 "Rig": row['Rig_Number'],
                 "Well": f"{well_name} ",
                 "Job Type": "MAINT",
-                "Expected Date": start_date,
-                "Latest Expected Date": end_date if not pd.isna(end_date) else start_date,
+                "Expected Date": start_date_raw,
+                "Latest Expected Date": end_date_raw if not pd.isna(end_date_raw) else start_date_raw,
                 **{col: row[col] for col in extra_columns if col in row}
             })
         else:
@@ -108,7 +108,7 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
                 offset = pd.to_numeric(row[col], errors='coerce')
                 if pd.isna(offset):
                     continue
-                expected_date = start_date + timedelta(days=int(offset))
+                expected_date = start_date_raw + timedelta(days=int(offset))
                 latest_expected = expected_date + timedelta(days=latest_days)
                 records.append({
                     "Rig": row['Rig_Number'],
@@ -121,19 +121,23 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
 
     result_df = pd.DataFrame(records)
 
-    # Apply month/year filter
-    if not result_df.empty:
-        if selected_month != "All":
-            result_df = result_df[result_df['Expected Date'].dt.month == selected_month]
-        if selected_year != "All":
-            result_df = result_df[result_df['Expected Date'].dt.year == selected_year]
+    # Apply date range filter
+    if not result_df.empty and start_date and end_date:
+        # Ensure dates are in datetime format
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+
+        # Filter by date range (inclusive of both start and end dates)
+        mask = (result_df['Expected Date'] >= start_date) & (result_df['Expected Date'] <= end_date)
+        result_df = result_df[mask]
 
     if result_df.empty:
         return pd.DataFrame()
 
     # Replace N/A or blanks in Gyro Provider again (post-merge)
     if "Gyro Provider" in result_df.columns:
-        result_df['Gyro Provider'] = result_df['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
+        result_df['Gyro Provider'] = result_df['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""],
+                                                                        "MWD")
 
     # Separate maintenance rows
     maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
@@ -149,7 +153,8 @@ def process_files(file1, file2, selected_month, selected_year, selected_party, l
     if "Expected Date" in result_df.columns:
         result_df['Expected Date'] = pd.to_datetime(result_df['Expected Date'], errors='coerce').dt.strftime('%d-%b-%Y')
     if "Latest Expected Date" in result_df.columns:
-        result_df['Latest Expected Date'] = pd.to_datetime(result_df['Latest Expected Date'], errors='coerce').dt.strftime('%d-%b-%Y')
+        result_df['Latest Expected Date'] = pd.to_datetime(result_df['Latest Expected Date'],
+                                                           errors='coerce').dt.strftime('%d-%b-%Y')
 
     result_df.rename(columns={"Expected Date": "Earlier Expected Date"}, inplace=True)
 
@@ -170,75 +175,144 @@ def main():
     st.title("🏗️ Rig Schedule Processor")
     st.markdown("Upload **Schedule File** and **Rig Details File** to generate expected rig schedule.")
 
+    # Initialize session state for files
+    if 'file1' not in st.session_state:
+        st.session_state.file1 = None
+    if 'file2' not in st.session_state:
+        st.session_state.file2 = None
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("📂 Schedule File")
-        file1 = st.file_uploader("Upload schedule Excel file", type=['xlsx', 'xls'], key="file1")
+        uploaded_file1 = st.file_uploader("Upload schedule Excel file", type=['xlsx', 'xls'], key="uploader1")
+        if uploaded_file1:
+            st.session_state.file1 = uploaded_file1
     with col2:
         st.subheader("📂 Rig Details File")
-        file2 = st.file_uploader("Upload rig details Excel file", type=['xlsx', 'xls'], key="file2")
+        uploaded_file2 = st.file_uploader("Upload rig details Excel file", type=['xlsx', 'xls'], key="uploader2")
+        if uploaded_file2:
+            st.session_state.file2 = uploaded_file2
 
-    months = ["All"] + list(range(1, 13))
-    years = ["All"] + list(range(datetime.now().year, datetime.now().year + 5))
+    # Set default date range (next 30 days)
+    default_start = datetime.now().date()
+    default_end = (datetime.now() + timedelta(days=30)).date()
+
+    # Use session state for dates to persist across reruns
+    if 'start_date' not in st.session_state:
+        st.session_state.start_date = default_start
+    if 'end_date' not in st.session_state:
+        st.session_state.end_date = default_end
 
     parties = ["All"]
     extra_columns = []
-    if file2:
+
+    # Get Gyro Provider options from file2 if available
+    if st.session_state.file2:
         try:
-            df2_temp = read_with_header_detection(file2)
+            # Reset file pointer to beginning
+            st.session_state.file2.seek(0)
+            df2_temp = read_with_header_detection(st.session_state.file2)
             if 'Gyro Provider' in df2_temp.columns:
-                df2_temp['Gyro Provider'] = df2_temp['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
+                df2_temp['Gyro Provider'] = df2_temp['Gyro Provider'].replace(
+                    ["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
                 parties = ["All"] + sorted(df2_temp['Gyro Provider'].dropna().unique().tolist())
-        except:
-            pass
+        except Exception as e:
+            st.error(f"Error reading rig details file: {e}")
 
     st.subheader("🔧 Filters & Options")
     col3, col4, col5 = st.columns(3)
     with col3:
-        selected_month = st.selectbox("📅 Select Month", months)
+        # Date range selector
+        start_date = st.date_input(
+            "📅 Start Date",
+            value=st.session_state.start_date,
+            help="Select the start date for the date range"
+        )
+        st.session_state.start_date = start_date
     with col4:
-        selected_year = st.selectbox("📅 Select Year", years)
+        end_date = st.date_input(
+            "📅 End Date",
+            value=st.session_state.end_date,
+            help="Select the end date for the date range"
+        )
+        st.session_state.end_date = end_date
     with col5:
         selected_party = st.selectbox("🏢 Select Gyro Provider", parties)
 
+    # Validate date range
+    if start_date > end_date:
+        st.error("❌ Error: End date must be after start date")
+        st.stop()
+
     latest_days = st.number_input("➕ Add days for Latest Expected Date", min_value=0, max_value=30, value=2)
 
-    if file1:
-        df1_temp = pd.read_excel(file1, nrows=1)
-        cols = df1_temp.columns.tolist()
-        extra_columns = st.multiselect("📋 Extra columns from Schedule File", cols)
+    # Get extra columns from file1 if available
+    if st.session_state.file1:
+        try:
+            # Reset file pointer to beginning
+            st.session_state.file1.seek(0)
+            df1_temp = pd.read_excel(st.session_state.file1, nrows=1)
+            cols = df1_temp.columns.tolist()
+            extra_columns = st.multiselect("📋 Extra columns from Schedule File", cols)
+        except Exception as e:
+            st.error(f"Error reading schedule file: {e}")
 
-    if file1 and file2:
+    # Process files when both are uploaded
+    if st.session_state.file1 and st.session_state.file2:
         with st.spinner("🔄 Processing..."):
-            result_df = process_files(file1, file2, selected_month, selected_year, selected_party, latest_days, extra_columns)
+            try:
+                # Reset file pointers before processing
+                st.session_state.file1.seek(0)
+                st.session_state.file2.seek(0)
 
-        if not result_df.empty:
-            st.success(f"✅ Processed {len(result_df)} records")
-            st.dataframe(result_df, use_container_width=True)
+                result_df = process_files(
+                    st.session_state.file1,
+                    st.session_state.file2,
+                    start_date,
+                    end_date,
+                    selected_party,
+                    latest_days,
+                    extra_columns
+                )
 
-            # ---------- Export Section ----------
-            csv = result_df.to_csv(index=False)
+                if not result_df.empty:
+                    st.success(
+                        f"✅ Processed {len(result_df)} records for date range {start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}")
+                    st.dataframe(result_df, use_container_width=True)
 
-            excel_buffer = BytesIO()
-            result_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-            excel_buffer.seek(0)
+                    # ---------- Export Section ----------
+                    csv = result_df.to_csv(index=False)
 
-            st.download_button(
-                "📥 Download CSV",
-                data=csv,
-                file_name=f"rig_schedule_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
+                    excel_buffer = BytesIO()
+                    result_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                    excel_buffer.seek(0)
 
-            st.download_button(
-                "📘 Download Excel",
-                data=excel_buffer,
-                file_name=f"rig_schedule_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                    col6, col7 = st.columns(2)
+                    with col6:
+                        st.download_button(
+                            "📥 Download CSV",
+                            data=csv,
+                            file_name=f"rig_schedule_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv",
+                            mime="text/csv"
+                        )
+                    with col7:
+                        st.download_button(
+                            "📘 Download Excel",
+                            data=excel_buffer,
+                            file_name=f"rig_schedule_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
 
-        else:
-            st.warning("❌ No matching records found for the selected filters.")
+                else:
+                    st.warning(
+                        f"❌ No matching records found for the date range {start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}.")
+
+            except Exception as e:
+                st.error(f"❌ Error processing files: {e}")
+                st.info("Please try uploading the files again.")
+
+    elif st.session_state.file1 or st.session_state.file2:
+        st.info("📁 Please upload both files to process the data.")
 
 
 if __name__ == "__main__":
