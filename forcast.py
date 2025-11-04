@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import re
 from io import BytesIO
 
-
 # ---------- Helpers ----------
 
 def extract_rig_number(work_center):
@@ -34,6 +33,30 @@ def read_with_header_detection(file, keywords=["Rig", "Gyro Provider", "Service 
     return df
 
 
+def normalize_gyro_provider(x: str) -> str:
+    """
+    Normalize Gyro Provider names.
+    - Blank/N/A -> 'MWD'
+    - Any variant of 'gasyway' -> 'GASYWAY'
+    - Otherwise: uppercase, trimmed
+    """
+    if x is None:
+        return "MWD"
+    s = str(x).strip()
+    if s == "" or s.lower() in {"n/a", "na"}:
+        return "MWD"
+
+    s_low = s.lower().replace(" ", "").replace("-", "")
+    # Add any real-world variants you observe here:
+    gasyway_variants = {
+        "gasyway", "gasywey", "gasyawy", "gasy", "gasywayllc", "gaswy", "gasywa"
+    }
+    if s_low in gasyway_variants:
+        return "GASYWAY"
+
+    return s.upper()
+
+
 # ---------- Core Processing ----------
 
 def process_files(file1, file2, start_date, end_date, selected_party, latest_days, extra_columns):
@@ -41,23 +64,39 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
 
     # Read first file (schedule)
     df1 = pd.read_excel(file1)
+    if 'Work Center' not in df1.columns:
+        raise ValueError("Schedule file is missing required column: 'Work Center'")
+    if 'Earl.start date' not in df1.columns:
+        raise ValueError("Schedule file is missing required column: 'Earl.start date'")
+    if 'Service Type' not in df1.columns:
+        raise ValueError("Schedule file is missing required column: 'Service Type'")
+    if 'Well Name' not in df1.columns:
+        raise ValueError("Schedule file is missing required column: 'Well Name'")
+
     df1['Rig_Number'] = df1['Work Center'].apply(extract_rig_number)
     df1 = df1.dropna(subset=['Rig_Number'])
     df1['Rig_Number'] = df1['Rig_Number'].astype(int)
 
     # Read second file (rig details)
     df2 = read_with_header_detection(file2)
+    if 'Rig' not in df2.columns:
+        raise ValueError("Rig details file is missing required column: 'Rig'")
+
+    # Normalize and clean key columns
     df2['Rig'] = pd.to_numeric(df2['Rig'], errors='coerce')
     df2 = df2.dropna(subset=['Rig'])
     df2['Rig'] = df2['Rig'].astype(int)
 
-    # Replace N/A or blanks in Gyro Provider with 'MWD'
+    # Normalize Gyro Provider (create if missing)
     if "Gyro Provider" in df2.columns:
-        df2['Gyro Provider'] = df2['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
+        df2["Gyro Provider"] = df2["Gyro Provider"].apply(normalize_gyro_provider)
+    else:
+        # If it's not provided at all, create with MWD default
+        df2["Gyro Provider"] = "MWD"
 
     # Filter by Gyro Provider
     if selected_party != "All" and "Gyro Provider" in df2.columns:
-        df2 = df2[df2['Gyro Provider'] == selected_party]
+        df2 = df2[df2["Gyro Provider"] == normalize_gyro_provider(selected_party)]
 
     # Merge schedule + rig details
     merged = pd.merge(
@@ -71,7 +110,7 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
     if merged.empty:
         return pd.DataFrame()
 
-    # Always include Gyro Provider in the output if available
+    # Ensure "Gyro Provider" is always included in output
     if "Gyro Provider" in merged.columns and "Gyro Provider" not in extra_columns:
         extra_columns = ["Gyro Provider"] + extra_columns
 
@@ -104,11 +143,9 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
                 **{col: row[col] for col in extra_columns if col in row}
             })
         else:
-            for col in callout_cols:
-                offset = pd.to_numeric(row[col], errors='coerce')
-                if pd.isna(offset):
-                    continue
-                expected_date = start_date_raw + timedelta(days=int(offset))
+            if not callout_cols:
+                # If there are no explicit callout columns, treat the start date as one expected date
+                expected_date = start_date_raw
                 latest_expected = expected_date + timedelta(days=latest_days)
                 records.append({
                     "Rig": row['Rig_Number'],
@@ -118,6 +155,21 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
                     "Latest Expected Date": latest_expected,
                     **{col: row[col] for col in extra_columns if col in row}
                 })
+            else:
+                for col in callout_cols:
+                    offset = pd.to_numeric(row[col], errors='coerce')
+                    if pd.isna(offset):
+                        continue
+                    expected_date = start_date_raw + timedelta(days=int(offset))
+                    latest_expected = expected_date + timedelta(days=latest_days)
+                    records.append({
+                        "Rig": row['Rig_Number'],
+                        "Well": well_name,
+                        "Job Type": row['Service Type'],
+                        "Expected Date": expected_date,
+                        "Latest Expected Date": latest_expected,
+                        **{col: row[col] for col in extra_columns if col in row}
+                    })
 
     result_df = pd.DataFrame(records)
 
@@ -127,17 +179,16 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
         start_date = pd.to_datetime(start_date)
         end_date = pd.to_datetime(end_date)
 
-        # Filter by date range (inclusive of both start and end dates)
+        # Filter by date range (inclusive)
         mask = (result_df['Expected Date'] >= start_date) & (result_df['Expected Date'] <= end_date)
         result_df = result_df[mask]
 
     if result_df.empty:
         return pd.DataFrame()
 
-    # Replace N/A or blanks in Gyro Provider again (post-merge)
+    # Normalize Gyro Provider again (post-merge)
     if "Gyro Provider" in result_df.columns:
-        result_df['Gyro Provider'] = result_df['Gyro Provider'].replace(["N/A", "n/a", "NA", "na", None, np.nan, ""],
-                                                                        "MWD")
+        result_df["Gyro Provider"] = result_df["Gyro Provider"].apply(normalize_gyro_provider)
 
     # Separate maintenance rows
     maint_df = result_df[result_df['Job Type'] == "MAINT"].copy()
@@ -156,13 +207,12 @@ def process_files(file1, file2, start_date, end_date, selected_party, latest_day
         result_df['Latest Expected Date'] = pd.to_datetime(result_df['Latest Expected Date'],
                                                            errors='coerce').dt.strftime('%d-%b-%Y')
 
+    # Rename for final display
     result_df.rename(columns={"Expected Date": "Earlier Expected Date"}, inplace=True)
 
-    # Final column order (Gyro Provider added)
+    # Final column order
     base_cols = ['S.No', 'Rig', 'Well', 'Job Type', 'Gyro Provider', 'Earlier Expected Date', 'Latest Expected Date']
-
-    # Only keep columns that exist
-    base_cols = [col for col in base_cols if col in result_df.columns]
+    base_cols = [col for col in base_cols if col in result_df.columns]  # keep only existing
 
     return result_df[base_cols + [col for col in extra_columns if col not in base_cols]]
 
@@ -197,7 +247,7 @@ def main():
     default_start = datetime.now().date()
     default_end = (datetime.now() + timedelta(days=30)).date()
 
-    # Use session state for dates to persist across reruns
+    # Persist dates
     if 'start_date' not in st.session_state:
         st.session_state.start_date = default_start
     if 'end_date' not in st.session_state:
@@ -206,23 +256,29 @@ def main():
     parties = ["All"]
     extra_columns = []
 
-    # Get Gyro Provider options from file2 if available
+    # Build Gyro Provider options from file2 (normalized), and default to GASYWAY if present
     if st.session_state.file2:
         try:
-            # Reset file pointer to beginning
             st.session_state.file2.seek(0)
             df2_temp = read_with_header_detection(st.session_state.file2)
             if 'Gyro Provider' in df2_temp.columns:
-                df2_temp['Gyro Provider'] = df2_temp['Gyro Provider'].replace(
-                    ["N/A", "n/a", "NA", "na", None, np.nan, ""], "MWD")
-                parties = ["All"] + sorted(df2_temp['Gyro Provider'].dropna().unique().tolist())
+                df2_temp['Gyro Provider'] = df2_temp['Gyro Provider'].apply(normalize_gyro_provider)
+            else:
+                df2_temp['Gyro Provider'] = "MWD"
+
+            unique_parties = sorted(pd.Series(df2_temp['Gyro Provider'].dropna().unique()).tolist())
+            parties = ["All"] + unique_parties
+            default_idx = parties.index("GASYWAY") if "GASYWAY" in parties else 0
+
         except Exception as e:
             st.error(f"Error reading rig details file: {e}")
+            default_idx = 0
+    else:
+        default_idx = 0
 
     st.subheader("🔧 Filters & Options")
     col3, col4, col5 = st.columns(3)
     with col3:
-        # Date range selector
         start_date = st.date_input(
             "📅 Start Date",
             value=st.session_state.start_date,
@@ -237,7 +293,7 @@ def main():
         )
         st.session_state.end_date = end_date
     with col5:
-        selected_party = st.selectbox("🏢 Select Gyro Provider", parties)
+        selected_party = st.selectbox("🏢 Select Gyro Provider", parties, index=default_idx)
 
     # Validate date range
     if start_date > end_date:
@@ -246,10 +302,9 @@ def main():
 
     latest_days = st.number_input("➕ Add days for Latest Expected Date", min_value=0, max_value=30, value=2)
 
-    # Get extra columns from file1 if available
+    # Extra columns from schedule file (optional)
     if st.session_state.file1:
         try:
-            # Reset file pointer to beginning
             st.session_state.file1.seek(0)
             df1_temp = pd.read_excel(st.session_state.file1, nrows=1)
             cols = df1_temp.columns.tolist()
@@ -277,7 +332,9 @@ def main():
 
                 if not result_df.empty:
                     st.success(
-                        f"✅ Processed {len(result_df)} records for date range {start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}")
+                        f"✅ Processed {len(result_df)} records for date range "
+                        f"{start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}"
+                    )
                     st.dataframe(result_df, use_container_width=True)
 
                     # ---------- Export Section ----------
@@ -305,7 +362,9 @@ def main():
 
                 else:
                     st.warning(
-                        f"❌ No matching records found for the date range {start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}.")
+                        f"❌ No matching records found for the date range "
+                        f"{start_date.strftime('%d-%b-%Y')} to {end_date.strftime('%d-%b-%Y')}."
+                    )
 
             except Exception as e:
                 st.error(f"❌ Error processing files: {e}")
